@@ -1,66 +1,68 @@
 import pandas as pd
-import numpy as np
-import os
-import json
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
-from torch.nn.functional import softmax
 import streamlit as st
 import plotly.graph_objects as go
 import base64
+import json
+import requests
+import os
+from pathlib import Path
+from datetime import datetime
+
+# Import shared configuration
+from pages.helper.config import OLLAMA_IP, MODEL_NAME, SUMMARY_DB, STRESS_THRESHOLD, CONFLICT_THRESHOLD
 
 # Set page configuration
 st.set_page_config(page_title="Employee Performance Analyzer", layout="wide")
 st.title("Employee Performance Analyzer")
 
-# Global variables to store models and data
-sentiment_tokenizer = None
-sentiment_model = None
-nlp_tokenizer = None
-nlp_model = None
-kpi_week1_df = None
-kpi_week2_df = None
-survey_df = None
-
-# Function to analyze sentiment
-def analyze_sentiment(text, sentiment_model_id="tabularisai/multilingual-sentiment-analysis"):
+# Function to analyze sentiment using Ollama API
+def analyze_sentiment(text):
     """
-    Analyzes sentiment from text using local sentiment model
+    Analyzes sentiment from text using Ollama API
     """
-    global sentiment_tokenizer, sentiment_model
-    
     if not text or not isinstance(text, str) or len(text.strip()) < 5:
         return {'score': 0, 'label': 'neutral'}
     
     try:
-        # Initialize sentiment models if not already done
-        if sentiment_tokenizer is None or sentiment_model is None:
-            st.write("Loading sentiment analysis model...")
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            sentiment_tokenizer = AutoTokenizer.from_pretrained(sentiment_model_id)
-            sentiment_model = AutoModelForSequenceClassification.from_pretrained(sentiment_model_id).to(device)
-            st.write(f"Sentiment model loaded on {device}")
+        prompt = f"""
+        Analyze the sentiment of the following text and respond with only one word: 'positive', 'negative', or 'neutral'.
+        Then on a new line, give a score between -1 and 1, where -1 is very negative, 0 is neutral, and 1 is very positive.
         
-        # Get the device where the model is loaded
-        device = next(sentiment_model.parameters()).device
+        Text: "{text}"
         
-        # Tokenize and get prediction
-        encoded_input = sentiment_tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to(device)
-        output = sentiment_model(**encoded_input)
-        scores = softmax(output.logits, dim=1).detach().cpu().numpy()[0]
+        Response format:
+        LABEL
+        SCORE
+        """
         
-        # Get prediction
-        predicted_class = torch.argmax(output.logits, dim=1).item()
-        id2label = sentiment_model.config.id2label
-        label = id2label[predicted_class].lower()
-        score = float(scores[predicted_class])
+        payload = {
+            "model": MODEL_NAME,
+            "prompt": prompt,
+            "stream": False
+        }
         
-        # Adjust score format
+        res = requests.post(f"{OLLAMA_IP}/api/generate", json=payload)
+        res.raise_for_status()
+        response_text = res.json().get('response', '')
+        
+        # Parse response
+        lines = response_text.strip().split('\n')
+        if len(lines) >= 2:
+            label = lines[0].strip().lower()
+            try:
+                score = float(lines[1].strip())
+            except ValueError:
+                score = 0.0
+        else:
+            label = 'neutral'
+            score = 0.0
+        
+        # Format result
         sentiment = {'label': label}
         if label == 'positive':
-            sentiment['score'] = score
+            sentiment['score'] = abs(score)
         elif label == 'negative':
-            sentiment['score'] = -score
+            sentiment['score'] = -abs(score)
         else:
             sentiment['score'] = 0
             
@@ -69,30 +71,6 @@ def analyze_sentiment(text, sentiment_model_id="tabularisai/multilingual-sentime
     except Exception as e:
         st.error(f"Error analyzing sentiment: {e}")
         return {'score': 0, 'label': 'neutral'}
-
-# Function to load language model
-def load_language_model(model_id="ibm-granite/granite-3.3-2b-instruct"):
-    """
-    Initialize language model for summary generation
-    """
-    global nlp_tokenizer, nlp_model
-    
-    st.write(f"Loading language model: {model_id}")
-    
-    try:
-        # Check if GPU is available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        st.write(f"Using device: {device}")
-        
-        # Initialize tokenizer and model
-        nlp_tokenizer = AutoTokenizer.from_pretrained(model_id)
-        nlp_model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
-        
-        st.write("Language model loaded successfully!")
-        return True
-    except Exception as e:
-        st.error(f"Error loading language model: {e}")
-        return False
 
 # Function to prepare performance data for prompt
 def prepare_performance_data(employee_data, comparative_data=None):
@@ -165,39 +143,21 @@ def create_summary_prompt(performance_text):
     """
     return prompt
 
-# Function to generate summary using the language model
+# Function to generate summary using Ollama API
 def generate_summary(prompt):
     """
-    Generate summary using the language model
+    Generate summary using Ollama API
     """
-    global nlp_tokenizer, nlp_model
-    
     try:
-        # Check if model is loaded
-        if nlp_tokenizer is None or nlp_model is None:
-            st.error("Language model is not loaded")
-            return "Language model is not loaded"
+        payload = {
+            "model": MODEL_NAME,
+            "prompt": prompt,
+            "stream": False
+        }
         
-        # Use the model for text generation
-        device = next(nlp_model.parameters()).device
-        inputs = nlp_tokenizer(prompt, return_tensors="pt").to(device)
-        
-        # Generate text
-        with torch.no_grad():
-            outputs = nlp_model.generate(
-                inputs.input_ids,
-                max_new_tokens=250,
-                temperature=0.2,
-                top_p=0.95,
-                do_sample=True
-            )
-        
-        # Decode the generated text
-        response = nlp_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract just the generated part (remove the prompt)
-        if prompt in response:
-            response = response.replace(prompt, "").strip()
+        res = requests.post(f"{OLLAMA_IP}/api/generate", json=payload)
+        res.raise_for_status()
+        response = res.json().get('response', 'No response generated')
         
         return response
     
@@ -303,6 +263,10 @@ def process_employee_data(kpi_week1_df, kpi_week2_df, survey_df, employee_id=Non
     }
     
     all_summaries = {}
+    recommendations = {
+        "psychologist": [],
+        "conflict_resolution": []
+    }
     
     # If employee_id is provided, only process that employee
     if employee_id:
@@ -312,6 +276,19 @@ def process_employee_data(kpi_week1_df, kpi_week2_df, survey_df, employee_id=Non
     
     # Progress bar
     progress_bar = st.progress(0)
+    
+    # Verify Ollama connection
+    try:
+        test_payload = {
+            "model": MODEL_NAME,
+            "prompt": "hello",
+            "stream": False
+        }
+        requests.post(f"{OLLAMA_IP}/api/generate", json=test_payload).raise_for_status()
+        st.success(f"Successfully connected to Ollama API with model {MODEL_NAME}")
+    except Exception as e:
+        st.error(f"Error connecting to Ollama API: {e}")
+        return {}
     
     # Iterate through each employee
     for i, emp_id in enumerate(employee_ids):
@@ -353,11 +330,11 @@ def process_employee_data(kpi_week1_df, kpi_week2_df, survey_df, employee_id=Non
                 
                 if len(stress_text) > 5:
                     stress_analysis = analyze_sentiment(stress_text)
-                    need_psychologist = stress_analysis['label'] == 'negative' and stress_analysis['score'] < -0.3
+                    need_psychologist = stress_analysis['label'] == 'negative' and stress_analysis['score'] < STRESS_THRESHOLD
                 
                 if len(conflict_text) > 5:
                     conflict_analysis = analyze_sentiment(conflict_text)
-                    need_conflict_resolution = conflict_analysis['label'] == 'negative' and conflict_analysis['score'] < -0.3
+                    need_conflict_resolution = conflict_analysis['label'] == 'negative' and conflict_analysis['score'] < CONFLICT_THRESHOLD
             
             # Add evaluation results to employee data
             emp_week2['bad_metrics'] = bad_metrics
@@ -389,8 +366,24 @@ def process_employee_data(kpi_week1_df, kpi_week2_df, survey_df, employee_id=Non
             all_summaries[emp_id] = {
                 'employee_name': emp_week2['Employee Name'],
                 'employee_id': emp_id,
-                'summary': combined_summary
+                'summary': combined_summary,
+                'structured_summary': summary_data,
+                'timestamp': datetime.now().isoformat(),
+                'need_psychologist': need_psychologist,
+                'need_conflict_resolution': need_conflict_resolution,
+                'performance_metrics': {
+                    'tasks_completed': emp_week2['Productivity: Number of tasks completed'],
+                    'time_per_task': emp_week2['Productivity: Time to complete tasks (hours/task)'],
+                    'error_rate': emp_week2['Quality of Work: Error rate (%)'],
+                    'customer_satisfaction': emp_week2['Quality of Work: Customer satisfaction rate (%)'],
+                }
             }
+            
+            # Add to recommendations lists if needed
+            if need_psychologist:
+                recommendations["psychologist"].append(emp_week2['Employee Name'])
+            if need_conflict_resolution:
+                recommendations["conflict_resolution"].append(emp_week2['Employee Name'])
             
         except Exception as e:
             st.error(f"Error processing employee {emp_id}: {e}")
@@ -399,7 +392,27 @@ def process_employee_data(kpi_week1_df, kpi_week2_df, survey_df, employee_id=Non
     # Clear progress bar
     progress_bar.empty()
     
-    return all_summaries
+    # Save summaries to JSON file for other pages to use
+    try:
+        # If file exists, read existing data and update it
+        existing_data = {}
+        if os.path.exists(SUMMARY_DB):
+            with open(SUMMARY_DB, 'r') as file:
+                existing_data = json.load(file)
+        
+        # Update with new data
+        for emp_id, data in all_summaries.items():
+            existing_data[emp_id] = data
+        
+        # Write back to file
+        with open(SUMMARY_DB, 'w') as file:
+            json.dump(existing_data, file, indent=2)
+        
+        st.success(f"Successfully saved {len(all_summaries)} employee summaries to database.")
+    except Exception as e:
+        st.error(f"Error saving summaries to database: {e}")
+    
+    return all_summaries, recommendations
 
 # Function to export to CSV
 def export_to_csv(summaries):
@@ -443,114 +456,121 @@ if st.button("Upload and Process Files"):
             
             st.success(f"Files uploaded successfully. {len(kpi_week2_df['Employee ID'].unique())} employees found.")
             
-            # Initialize language model
-            with st.spinner("Initializing language model..."):
-                model_loaded = load_language_model()
+            # Verify Ollama is running
+            with st.spinner("Checking Ollama connection..."):
+                try:
+                    test_payload = {
+                        "model": MODEL_NAME,
+                        "prompt": "hello",
+                        "stream": False
+                    }
+                    requests.post(f"{OLLAMA_IP}/api/generate", json=test_payload).raise_for_status()
+                    st.success("Ollama API is running and model is available")
+                except Exception as e:
+                    st.error(f"Error connecting to Ollama API: {e}")
+                    st.stop()
                 
-            if model_loaded:
-                st.success("Language model initialized successfully.")
+            # Process data
+            with st.spinner("Processing employee data..."):
+                summaries, recommendations = process_employee_data(kpi_week1_df, kpi_week2_df, survey_df)
                 
-                # Process data
-                with st.spinner("Processing employee data..."):
-                    summaries = process_employee_data(kpi_week1_df, kpi_week2_df, survey_df)
-                    
-                if summaries:
-                    st.success(f"Successfully processed {len(summaries)} employees.")
-                    
-                    # Display summaries
-                    st.header("Employee Summaries")
-                    
-                    # Convert summaries to dataframe
-                    summary_data = []
-                    for emp_id, data in summaries.items():
-                        summary_data.append({
-                            'Employee ID': emp_id,
-                            'Employee Name': data['employee_name'],
-                            'Summary': data['summary']
-                        })
-                    
-                    summary_df = pd.DataFrame(summary_data)
-                    st.dataframe(summary_df)
-                    
-                    # Export options
-                    st.header("Export Options")
-                    
-                    # Export to CSV
-                    download_link = export_to_csv(summaries)
-                    st.markdown(download_link, unsafe_allow_html=True)
-                    
-                    # Save to file
-                    if st.button("Save to CSV File"):
-                        try:
-                            # Create DataFrame for export
-                            export_df = pd.DataFrame(summary_data)
-                            export_df.to_csv("employee_summaries.csv", index=False)
-                            st.success("File saved to employee_summaries.csv")
-                        except Exception as e:
-                            st.error(f"Error saving file: {e}")
+            if summaries:
+                st.success(f"Successfully processed {len(summaries)} employees.")
                 
+                # Display summaries
+                st.header("Employee Summaries")
+                
+                # Convert summaries to dataframe
+                summary_data = []
+                for emp_id, data in summaries.items():
+                    summary_data.append({
+                        'Employee ID': emp_id,
+                        'Employee Name': data['employee_name'],
+                        'Summary': data['summary']
+                    })
+                
+                summary_df = pd.DataFrame(summary_data)
+                st.dataframe(summary_df)
+                
+                # Display recommendations
+                st.header("Recommendations")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("Employees Needing Psychologist")
+                    if recommendations["psychologist"]:
+                        for emp in recommendations["psychologist"]:
+                            st.write(f"- {emp}")
+                    else:
+                        st.write("None")
+                
+                with col2:
+                    st.subheader("Employees Needing Conflict Resolution")
+                    if recommendations["conflict_resolution"]:
+                        for emp in recommendations["conflict_resolution"]:
+                            st.write(f"- {emp}")
+                    else:
+                        st.write("None")
+                
+                # Export options
+                st.header("Export Options")
+                
+                # Export to CSV
+                download_link = export_to_csv(summaries)
+                st.markdown(download_link, unsafe_allow_html=True)
+                
+                # Save to file
+                if st.button("Save to CSV File"):
+                    try:
+                        # Create DataFrame for export
+                        export_df = pd.DataFrame(summary_data)
+                        export_df.to_csv("employee_summaries.csv", index=False)
+                        st.success("File saved to employee_summaries.csv")
+                    except Exception as e:
+                        st.error(f"Error saving file: {e}")
+            
         except Exception as e:
             st.error(f"Error processing files: {e}")
 
-# Simplified version for running without Streamlit UI
-def run_without_ui(kpi_week1_path, kpi_week2_path, survey_path, output_path="employee_summaries.csv"):
+# Function to view existing summaries from database
+def view_existing_summaries():
     """
-    Run the analysis without Streamlit UI
+    View previously generated summaries from database
     """
+    if not os.path.exists(SUMMARY_DB):
+        st.warning("No saved summaries found. Process employee data first.")
+        return
+    
     try:
-        print("Reading files...")
-        kpi_week1_df = pd.read_csv(kpi_week1_path)
-        kpi_week2_df = pd.read_csv(kpi_week2_path)
-        survey_df = pd.read_csv(survey_path)
+        with open(SUMMARY_DB, 'r') as file:
+            existing_data = json.load(file)
         
-        print(f"Files read successfully. {len(kpi_week2_df['Employee ID'].unique())} employees found.")
+        if not existing_data:
+            st.warning("No summaries found in database.")
+            return
         
-        # Initialize language model
-        print("Initializing language model...")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        # Display summaries
+        st.subheader("Previously Generated Summaries")
         
-        global nlp_tokenizer, nlp_model
-        model_id = "ibm-granite/granite-3.3-2b-instruct"
-        nlp_tokenizer = AutoTokenizer.from_pretrained(model_id)
-        nlp_model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
-        
-        print("Model initialized successfully.")
-        
-        # Process data
-        print("Processing employee data...")
-        summaries = process_employee_data(kpi_week1_df, kpi_week2_df, survey_df)
-        
-        # Export to CSV
-        print(f"Exporting summaries to {output_path}...")
+        # Convert to dataframe
         summary_data = []
-        for emp_id, data in summaries.items():
+        for emp_id, data in existing_data.items():
             summary_data.append({
                 'Employee ID': emp_id,
                 'Employee Name': data['employee_name'],
-                'Summary': data['summary']
+                'Summary': data['summary'],
+                'Timestamp': data.get('timestamp', 'Unknown')
             })
         
-        export_df = pd.DataFrame(summary_data)
-        export_df.to_csv(output_path, index=False)
+        summary_df = pd.DataFrame(summary_data)
+        st.dataframe(summary_df)
         
-        print(f"Analysis complete. Results saved to {output_path}")
-        
+        return existing_data
     except Exception as e:
-        print(f"Error: {e}")
+        st.error(f"Error loading summaries from database: {e}")
+        return None
 
-# Entry point for CLI usage
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        # If command line arguments are provided, run without UI
-        if len(sys.argv) >= 4:
-            kpi_week1_path = sys.argv[1]
-            kpi_week2_path = sys.argv[2]
-            survey_path = sys.argv[3]
-            output_path = sys.argv[4] if len(sys.argv) >= 5 else "employee_summaries.csv"
-            
-            run_without_ui(kpi_week1_path, kpi_week2_path, survey_path, output_path)
-        else:
-            print("Usage: python employee_analyzer.py <kpi_week1_path> <kpi_week2_path> <survey_path> [output_path]")
-    # else the script is being run with Streamlit UI
+# Add a section to view previously generated summaries
+st.header("2. View Previous Summaries")
+if st.button("Load Saved Summaries"):
+    existing_data = view_existing_summaries()
